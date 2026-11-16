@@ -1,0 +1,14 @@
+{
+  "name": "ai-video-kit",
+  "description": "Kit de edición de vídeo y motion graphics con IA para Claude Code (Remotion).",
+  "owner": {
+    "name": "Carlos"
+  },
+  "plugins": [
+    {
+      "name": "ai-video-kit",
+      "source": "./",
+      "description": "Edición de reels y motion graphics con Remotion: transiciones, recorte de persona, luz y audio uniformes."
+    }
+  ]
+}

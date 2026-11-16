@@ -1,0 +1,83 @@
+{
+  "skill_name": "motion-craft",
+  "evals": [
+    {
+      "id": "eval-01-saas-launch-cursor-typing",
+      "prompt": "/motion-craft Buat video promo 12 detik (1920x1080, 30fps) untuk produk SaaS AI Assistant. Tampilkan UI chat dan input di tengah dengan kamera yang zoom halus mengikuti ketikan dan kursor yang mengklik tombol Publish, lalu transisi seamless ke tampilan 3 window desktop. Subtitle narasi wajib rapi di bawah.",
+      "expected_checks": [
+        "Menggunakan BottomSubtitleBar di bagian bawah layar (tidak menaruh subtitle besar di tengah layar)",
+        "Menggunakan splineAt untuk kamera yang zoom mengikuti ketikan TypeText dan AnimatedCursor tanpa camera shake",
+        "Menggunakan SeamlessSceneShell (overlap 10 frame) untuk perpindahan antar-scene yang halus",
+        "Lulus node scripts/lint.mjs tanpa emoji dan tanpa Math.random()",
+        "Render aktual 1920x1080, 30fps, 360 frame; tidak ada objek penting terpotong atau bertabrakan dengan subtitle pada frame sampel",
+        "Jika ada narasi audio, timestamp berasal dari batas kata TTS/alignment; jika tidak ada narasi, jangan mengklaim sinkron audio"
+      ],
+      "required_artifacts": [
+        "out/v1.mp4",
+        "out/qa-stills/",
+        "research/geometry.json",
+        "out/evaluation/result.json"
+      ]
+    },
+    {
+      "id": "eval-02-vertical-reel-split-flap",
+      "prompt": "/motion-craft Buat video Reels 9:16 (1080x1920) durasi 10 detik tentang jadwal keberangkatan kereta cepat dengan gaya #10 (Split Flap) dan backsound B24.",
+      "expected_checks": [
+        "Memilih Gaya #10 Split Flap di research/style-bible.md",
+        "Mensintesis audio B24 dan SFX via scripts/synth-audio.mjs",
+        "Visual papan keberangkatan menjadi fokus utama di tengah, subtitle berada di area aman bawah",
+        "Render aktual 1080x1920, 30fps, 300 frame; periksa keterbacaan papan dan safe-zone pada format vertikal"
+      ],
+      "required_artifacts": [
+        "out/v1.mp4",
+        "research/style-bible.md",
+        "out/evaluation/result.json"
+      ]
+    },
+    {
+      "id": "eval-03-replication-100-percent",
+      "prompt": "/motion-craft Replikasi 100% sama persis video referensi ./ref.mp4 di Remotion, ukur dengan splineAt dan buktikan dengan skor SSIM dan PSNR.",
+      "expected_checks": [
+        "Mengekstrak metadata ffprobe dan frame referensi; jika ref.mp4 tidak tersedia, laporkan bahwa evaluasi belum dapat dilakukan",
+        "Mengikuti layout, kamera, badge/indikator, dan timing referensi meskipun berbeda dari default anti-slop",
+        "Menyamakan resolusi, fps, jumlah frame, dan offset waktu sebelum menjalankan SSIM/PSNR",
+        "Melaporkan rata-rata dan minimum skor per frame, frame terburuk, serta hasil tinjauan visual; jangan menyatakan 100% identik hanya dari metrik"
+      ],
+      "required_artifacts": [
+        "out/v1.mp4",
+        "out/evaluation/result.json",
+        "out/evaluation/ssim.log",
+        "diff.mp4"
+      ]
+    },
+    {
+      "id": "eval-04-brief-linux-gui",
+      "prompt": "Pakai motion-craft. Buatkan saya video motion graphics menggunakan Remotion tentang cara install Linux.",
+      "required_artifacts": [
+        "research/style-bible.md",
+        "research/storyboard.md",
+        "research/motion-plan.md",
+        "out/v1.mp4"
+      ],
+      "expected_checks": [
+        "Nyatakan asumsi installer grafis, distro, dan target instalasi. Buat rencana #12 + T023 yang menampilkan layar installer, kontrol, perubahan status, dan hasil.",
+        "Pilih framing dan label berdasarkan UI sumber. Jaga tipografi, margin, dan warna fokus konsisten. Cek keterbacaan pada frame pembuka, aksi, dan hasil."
+      ]
+    },
+    {
+      "id": "eval-05-brief-linux-cli",
+      "prompt": "Pakai motion-craft. Buat video 15 detik yang memperlihatkan instalasi paket dari terminal Linux dan cara mengecek hasilnya.",
+      "required_artifacts": [
+        "research/style-bible.md",
+        "research/storyboard.md",
+        "research/motion-plan.md",
+        "out/v1.mp4"
+      ],
+      "expected_checks": [
+        "Pilih #26 + T036. Gunakan prompt, perintah, output, dan status akhir sesuai lingkungan yang ditetapkan.",
+        "Tunjukkan command dan hasil pada hold yang terbaca. Pertahankan chrome platform, hindari kartu dekoratif, dan hentikan SFX ketik saat input selesai."
+      ]
+    }
+  ],
+  "evaluation_scope": "These are agent output scenarios, not executed by the local script regression suite. Produce and review the listed artifacts separately."
+}

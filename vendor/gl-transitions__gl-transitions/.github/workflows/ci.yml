@@ -1,0 +1,561 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      - name: Install dependencies
+        # Without the examples: the e2e and Reference renders workflows build them. With the
+        # optional dependencies: TypeScript 7's compiler is a native binary from an optional
+        # platform package (this also installs gl and webgpu, which this job does not use).
+        run: pnpm install --frozen-lockfile --filter '!gl-transitions-react-native-skia-example' --filter '!gl-transitions-remotion-example'
+
+      # glslang (checksummed download) and naga (cargo build, ~1 min) for the shader targets.
+      - name: Cache shader toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node_modules/.cache/gl-transitions-toolchain
+          key: shader-toolchain-${{ runner.os }}-${{ hashFiles('scripts/targets/toolchain.mjs') }}
+
+      - name: Lint transitions
+        run: pnpm run lint
+
+      - name: Check formatting
+        run: pnpm run format:check
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm run build
+
+      # Transitions need none: their changesets are written when the Version Packages PR is prepared.
+      - name: Check changesets
+        if: github.event_name == 'pull_request' && github.head_ref != 'changeset-release/master'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/checks/check-changesets.mjs "$BASE_SHA"
+
+  # Releases with changesets (https://changesets.dev/guide/automating): with pending changesets,
+  # opens or updates the "Version Packages" pull request; once it is merged, packs and publishes
+  # the new versions.
+  release-mode:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      publish-plan-artifact-id: ${{ steps.mode.outputs.publish-plan-artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter gl-transitions-repository --no-optional
+
+      # One for each transition added or changed since the last release (not committed).
+      - name: Write the changesets of the transitions
+        run: node scripts/npm-package/write-transition-changesets.mjs
+
+      - id: mode
+        uses: changesets/action/select-mode@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+
+  version:
+    needs: release-mode
+    if: needs.release-mode.outputs.mode == 'version'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter gl-transitions-repository --no-optional
+
+      # One for each transition added or changed since the last release (not committed).
+      - name: Write the changesets of the transitions
+        run: node scripts/npm-package/write-transition-changesets.mjs
+
+      - uses: changesets/action/version@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          # Also updates pnpm-lock.yaml, which records the peer ranges changesets bumps.
+          script: pnpm run changeset:version
+        env:
+          # For the changelog's links to pull requests and authors (@changesets/changelog-github).
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds and packs the new versions without publish rights: building runs native tools
+  # (glslang, naga compiled by cargo, headless GL and Dawn to fill compatibility.json), so it
+  # stays out of the job that holds the npm OIDC token. No cache here, so nothing written by
+  # other runs ends up in the published packages.
+  pack:
+    needs: release-mode
+    if: needs.release-mode.outputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    outputs:
+      pack-dir-artifact-id: ${{ steps.pack.outputs.pack-dir-artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1-mesa-dri libglapi-mesa libosmesa6 mesa-vulkan-drivers
+
+      # Only gl (headless WebGL), webgpu (Dawn) and React Native Skia run install scripts
+      # (allowBuilds in pnpm-workspace.yaml).
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter '!gl-transitions-react-native-skia-example' --filter '!gl-transitions-remotion-example'
+
+      # Informational: without references, compatibility.json says the targets were only compiled.
+      - name: Render references
+        continue-on-error: true
+        run: xvfb-run -s "-ac -screen 0 1280x1024x24" node scripts/rendering/render-references.mjs --out /tmp/refs
+
+      - name: Build
+        run: |
+          if [ -d /tmp/refs ]; then export REFERENCE_RENDERS=/tmp/refs; fi
+          pnpm -r run build
+
+      - id: pack
+        uses: changesets/action/pack@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          publish-plan-artifact-id: ${{ needs.release-mode.outputs.publish-plan-artifact-id }}
+
+  # Publishes the packed tarballs with npm trusted publishing (OIDC, no token; pnpm adds the
+  # provenance), then tags each release and creates its GitHub release.
+  publish:
+    needs: pack
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter gl-transitions-repository --no-optional
+
+      - uses: changesets/action/publish@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          pack-dir-artifact-id: ${{ needs.pack.outputs.pack-dir-artifact-id }}
+
+  # The Rust crate, after npm, when its version is not on crates.io yet. Not only in publish mode:
+  # a crate that failed to publish is retried on the next push to master.
+  pack-crate:
+    needs: [release-mode, pack, publish]
+    if: ${{ !cancelled() && needs.release-mode.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+          install_args: node
+
+      - name: Is the crate's version on crates.io?
+        id: version
+        run: |
+          version=$(node scripts/rust-crate/sync-version.mjs --check)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A 'gl-transitions-release (https://github.com/gl-transitions/gl-transitions)' \
+            "https://crates.io/api/v1/crates/gl-transitions/$version")
+          case "$status" in
+            200) echo "gl-transitions $version is on crates.io"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "gl-transitions $version is to publish"; echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io answered $status"; exit 1 ;;
+          esac
+
+      - name: Install Rust
+        if: steps.version.outputs.publish == 'true'
+        run: mise install --locked rust
+
+      # From the published npm package (the sources of CATALOG_VERSION); npm can take minutes
+      # to serve a version just published (3.0.0 took more than 100 s), and --prefer-online
+      # keeps a cached "no such version" from being reused.
+      - name: Build the crate's sources from the npm package
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          npm_version=$(node -p 'require("./packages/gl-transitions/package.json").version')
+          mkdir -p "$RUNNER_TEMP/npm"
+          for attempt in $(seq 1 20); do
+            if npm pack "gl-transitions@$npm_version" --prefer-online --pack-destination "$RUNNER_TEMP/npm"; then break; fi
+            if [ "$attempt" = 20 ]; then exit 1; fi
+            sleep 30
+          done
+          tar -xzf "$RUNNER_TEMP/npm/gl-transitions-$npm_version.tgz" -C "$RUNNER_TEMP/npm"
+          node scripts/rust-crate/build-crate.mjs --package "$RUNNER_TEMP/npm/package"
+
+      - name: Package
+        if: steps.version.outputs.publish == 'true'
+        working-directory: crates/gl-transitions
+        run: |
+          cargo package --locked --allow-dirty --list > "$RUNNER_TEMP/files.txt"
+          grep -qx 'generated/catalog.rs' "$RUNNER_TEMP/files.txt"
+          grep -q '^generated/sksl/' "$RUNNER_TEMP/files.txt"
+          cargo package --locked --allow-dirty
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.version.outputs.publish == 'true'
+        with:
+          name: gl-transitions-crate
+          path: |
+            crates/gl-transitions
+            !crates/gl-transitions/target
+            !crates/gl-transitions/node_modules
+          if-no-files-found: error
+          retention-days: 30
+
+  # crates.io trusted publishing (OIDC). --no-verify: pack-crate compiled it, nothing runs here.
+  publish-crate:
+    needs: pack-crate
+    if: ${{ !cancelled() && needs.pack-crate.result == 'success' && needs.pack-crate.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.pack-crate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+          install_args: rust
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gl-transitions-crate
+          path: ${{ runner.temp }}/gl-transitions-crate
+
+      # On a re-run.
+      - name: Is the crate's version on crates.io?
+        id: check
+        run: |
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A 'gl-transitions-release (https://github.com/gl-transitions/gl-transitions)' \
+            "https://crates.io/api/v1/crates/gl-transitions/$VERSION")
+          case "$status" in
+            200) echo "gl-transitions $VERSION is already on crates.io"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io answered $status"; exit 1 ;;
+          esac
+
+      - id: auth
+        if: steps.check.outputs.publish == 'true'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish
+        if: steps.check.outputs.publish == 'true'
+        working-directory: ${{ runner.temp }}/gl-transitions-crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          grep -q "^version = \"$VERSION\"" Cargo.toml
+          cargo publish --locked --no-verify --allow-dirty
+
+  # The Swift package, after npm, to the gl-transitions-swift repository (SwiftPM installs from git
+  # tags), with the npm package's version, when that tag does not exist yet. As for the crate, a
+  # version that failed to publish is retried on the next push to master.
+  pack-swift:
+    needs: [release-mode, pack, publish]
+    if: ${{ !cancelled() && needs.release-mode.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: macos-15
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+          install_args: node
+
+      - name: Is the version on gl-transitions-swift?
+        id: version
+        run: |
+          version=$(node -p 'require("./packages/gl-transitions/package.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          status=0
+          git ls-remote --exit-code https://github.com/gl-transitions/gl-transitions-swift "refs/tags/$version" > /dev/null || status=$?
+          case "$status" in
+            0) echo "$version is on gl-transitions-swift"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "$version is to publish"; echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) exit 1 ;;
+          esac
+
+      - name: Build the package from the npm package
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm"
+          for attempt in $(seq 1 20); do
+            if npm pack "gl-transitions@$VERSION" --prefer-online --pack-destination "$RUNNER_TEMP/npm"; then break; fi
+            if [ "$attempt" = 20 ]; then exit 1; fi
+            sleep 30
+          done
+          tar -xzf "$RUNNER_TEMP/npm/gl-transitions-$VERSION.tgz" -C "$RUNNER_TEMP/npm"
+          node scripts/swift-package/build-mirror.mjs --package "$RUNNER_TEMP/npm/package" --out "$RUNNER_TEMP/gl-transitions-swift"
+
+      - name: Test
+        if: steps.version.outputs.publish == 'true'
+        working-directory: ${{ runner.temp }}/gl-transitions-swift
+        run: |
+          swift test --scratch-path "$RUNNER_TEMP/swift-build"
+          xcodebuild build -quiet -scheme GLTransitions -destination generic/platform=iOS -derivedDataPath "$RUNNER_TEMP/derived-data"
+
+      # Without the hidden files (the .swiftpm/ of xcodebuild).
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.version.outputs.publish == 'true'
+        with:
+          name: gl-transitions-swift
+          path: ${{ runner.temp }}/gl-transitions-swift
+          if-no-files-found: error
+          retention-days: 30
+
+  # Pushes it with a deploy key of gl-transitions-swift. The host keys are GitHub's
+  # (https://api.github.com/meta).
+  publish-swift:
+    needs: pack-swift
+    if: ${{ !cancelled() && needs.pack-swift.result == 'success' && needs.pack-swift.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+          install_args: node
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gl-transitions-swift
+          path: ${{ runner.temp }}/gl-transitions-swift
+
+      - name: Publish
+        env:
+          VERSION: ${{ needs.pack-swift.outputs.version }}
+          SWIFT_DEPLOY_KEY: ${{ secrets.SWIFT_DEPLOY_KEY }}
+        run: |
+          ssh_dir="$RUNNER_TEMP/ssh"
+          mkdir -m 700 "$ssh_dir"
+          trap 'rm -rf "$ssh_dir"' EXIT
+          (umask 077 && printf '%s\n' "$SWIFT_DEPLOY_KEY" > "$ssh_dir/key")
+          cat > "$ssh_dir/known_hosts" <<'KEYS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          KEYS
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts -o StrictHostKeyChecking=yes"
+          node scripts/swift-package/publish-mirror.mjs "$RUNNER_TEMP/gl-transitions-swift" \
+            --remote git@github.com:gl-transitions/gl-transitions-swift.git --version "$VERSION"
+
+  # The Android library, after npm, to Maven Central with the npm package's version, when it is not
+  # there yet (retried on the next push to master too). Built, tested and published to a local
+  # repository here: publish-android only signs and uploads it.
+  pack-android:
+    needs: [release-mode, pack, publish]
+    if: ${{ !cancelled() && needs.release-mode.result == 'success' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          cache: false
+          install_args: node
+
+      - name: Is the version on Maven Central?
+        id: version
+        run: |
+          version=$(node -p 'require("./packages/gl-transitions/package.json").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            "https://repo1.maven.org/maven2/com/gl-transitions/gl-transitions/$version/gl-transitions-$version.pom")
+          case "$status" in
+            200) echo "$version is on Maven Central"; echo "publish=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "$version is to publish"; echo "publish=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Maven Central answered $status"; exit 1 ;;
+          esac
+
+      - name: Build the library's sources from the npm package
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm"
+          for attempt in $(seq 1 20); do
+            if npm pack "gl-transitions@$VERSION" --prefer-online --pack-destination "$RUNNER_TEMP/npm"; then break; fi
+            if [ "$attempt" = 20 ]; then exit 1; fi
+            sleep 30
+          done
+          tar -xzf "$RUNNER_TEMP/npm/gl-transitions-$VERSION.tgz" -C "$RUNNER_TEMP/npm"
+          node scripts/android-library/build-android-library.mjs --package "$RUNNER_TEMP/npm/package"
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        if: steps.version.outputs.publish == 'true'
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        if: steps.version.outputs.publish == 'true'
+        with:
+          cache-disabled: true
+
+      - name: Test and publish to a local repository
+        if: steps.version.outputs.publish == 'true'
+        working-directory: android
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: ./gradlew :gl-transitions:testDebugUnitTest :gl-transitions:publishReleasePublicationToStagingRepository -Pversion="$VERSION" --console=plain
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.version.outputs.publish == 'true'
+        with:
+          name: gl-transitions-android
+          path: android/gl-transitions/build/staging-repo
+          if-no-files-found: error
+          retention-days: 30
+
+  # Signs the publication and uploads it to the Central Portal, which releases it once validated
+  # (https://central.sonatype.org/publish/publish-portal-api/). Nothing is built here.
+  publish-android:
+    needs: pack-android
+    if: ${{ !cancelled() && needs.pack-android.result == 'success' && needs.pack-android.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    permissions: {}
+    env:
+      VERSION: ${{ needs.pack-android.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gl-transitions-android
+          path: ${{ runner.temp }}/gl-transitions-android
+
+      - name: Sign
+        working-directory: ${{ runner.temp }}/gl-transitions-android
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          dir="com/gl-transitions/gl-transitions/$VERSION"
+          files=("$dir/gl-transitions-$VERSION".{pom,module,aar} "$dir/gl-transitions-$VERSION"-{sources,javadoc}.jar)
+          grep -q "<version>$VERSION</version>" "$dir/gl-transitions-$VERSION.pom"
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s\n' "$SIGNING_KEY" | gpg --batch --quiet --import
+          for file in "${files[@]}"; do
+            printf '%s' "$SIGNING_PASSWORD" | gpg --batch --quiet --pinentry-mode loopback --passphrase-fd 0 --armor --detach-sign "$file"
+          done
+          zip -q "$RUNNER_TEMP/bundle.zip" "${files[@]}" "${files[@]/%/.asc}" "${files[@]/%/.md5}" "${files[@]/%/.sha1}"
+
+      # Unless the version is published already: on a re-run, or while repo1.maven.org does not serve
+      # a version just published yet.
+      - name: Upload and release
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          token=$(printf '%s:%s' "$MAVEN_CENTRAL_USERNAME" "$MAVEN_CENTRAL_PASSWORD" | base64 -w0)
+          echo "::add-mask::$token"
+          api() { curl --fail-with-body -sS -H "Authorization: Bearer $token" "$@"; }
+          published=$(api "https://central.sonatype.com/api/v1/publisher/published?namespace=com.gl-transitions&name=gl-transitions&version=$VERSION" | jq -r .published)
+          case "$published" in
+            true) echo "$VERSION is already on Maven Central"; exit 0 ;;
+            false) ;;
+            *) exit 1 ;;
+          esac
+          id=$(api -X POST -F "bundle=@$RUNNER_TEMP/bundle.zip;type=application/octet-stream" \
+            "https://central.sonatype.com/api/v1/publisher/upload?name=gl-transitions-$VERSION&publishingType=AUTOMATIC")
+          [[ "$id" =~ ^[0-9a-f-]+$ ]]
+          echo "Deployment $id"
+          for attempt in $(seq 1 100); do
+            sleep 30
+            status=$(api -X POST "https://central.sonatype.com/api/v1/publisher/status?id=$id") || continue
+            state=$(jq -r .deploymentState <<< "$status")
+            echo "$state"
+            case "$state" in
+              PUBLISHED) exit 0 ;;
+              FAILED) jq . <<< "$status"; exit 1 ;;
+            esac
+          done
+          echo "::error::Deployment $id is not published yet"
+          exit 1

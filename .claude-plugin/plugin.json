@@ -1,0 +1,7 @@
+{
+  "name": "ai-video-kit",
+  "description": "Skills para editar vídeos y hacer motion graphics con IA en Remotion: transiciones estilo CapCut, recorte de persona para texto detrás, luz y audio uniformes.",
+  "version": "0.1.0",
+  "author": { "name": "Carlos" },
+  "repository": "https://github.com/carlosmgv02/ai-video-kit"
+}

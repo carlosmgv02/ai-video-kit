@@ -1,0 +1,4 @@
+node_modules/
+.DS_Store
+skills/person-cutout/scripts/bin/
+__pycache__/

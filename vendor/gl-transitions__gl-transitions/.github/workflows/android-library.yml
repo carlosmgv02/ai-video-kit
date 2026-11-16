@@ -1,0 +1,132 @@
+name: Android library
+
+# Builds and tests the Android library (android/) and renders every transition with it on an
+# emulator, compared with the GLSL reference renders (scripts/android-library/check.mjs). Also
+# builds and tests the example app (examples/android) on the same emulator.
+
+on:
+  pull_request:
+    paths:
+      - "transitions/**"
+      - "scripts/**"
+      - "android/**"
+      - "examples/android/**"
+      - "packages/gl-transitions/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "mise.toml"
+      - "mise.lock"
+      - ".github/workflows/android-library.yml"
+  # On master too, to save the Gradle cache the pull requests read.
+  push:
+    branches: [master]
+    paths:
+      - "transitions/**"
+      - "scripts/**"
+      - "android/**"
+      - "examples/android/**"
+      - "packages/gl-transitions/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "mise.toml"
+      - "mise.lock"
+      - ".github/workflows/android-library.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-library-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1-mesa-dri libglapi-mesa libosmesa6
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --filter gl-transitions-repository --filter gl-transitions
+
+      - name: Cache shader toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: node_modules/.cache/gl-transitions-toolchain
+          key: shader-toolchain-${{ runner.os }}-${{ hashFiles('scripts/targets/toolchain.mjs') }}
+
+      - name: Build the npm package, the library's sources and the references
+        run: |
+          pnpm run build
+          pnpm run build:android
+          xvfb-run -s "-ac -screen 0 1280x1024x24" node scripts/rendering/render-references.mjs --out /tmp/refs > /dev/null
+
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/master' }}
+
+      # Publishing too: the publication ci.yml signs and uploads to Maven Central.
+      - name: Build and run the unit tests
+        working-directory: android
+        run: ./gradlew :gl-transitions:assembleDebug :gl-transitions:testDebugUnitTest :gl-transitions:assembleDebugAndroidTest :gl-transitions:publishReleasePublicationToStagingRepository --console=plain
+
+      - name: Build the example app
+        working-directory: examples/android
+        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest --console=plain
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The runner has no GPU: the emulator draws through SwiftShader (swangle). RuntimeShader
+      # needs Android 13.
+      - name: Run the device tests and the check on an emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          force-avd-creation: true
+          emulator-options: -no-snapshot-save -no-window -gpu swangle_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: |
+            android/gradlew -p android :gl-transitions:connectedDebugAndroidTest --console=plain
+            node scripts/android-library/check.mjs /tmp/refs --renders /tmp/android/renders --report /tmp/android/report.json
+            examples/android/gradlew -p examples/android :app:connectedDebugAndroidTest --console=plain
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f /tmp/android/report.json ]; then
+            node -e 'const r = require("/tmp/android/report.json"); console.log(`**Android (AGSL):** ${Object.entries(r.counts).map(([k, v]) => `${v} ${k}`).join(", ")} (of ${r.total})`)' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: android-renders
+          path: |
+            /tmp/android/
+            android/gl-transitions/build/reports/
+            examples/android/app/build/reports/
+          if-no-files-found: warn

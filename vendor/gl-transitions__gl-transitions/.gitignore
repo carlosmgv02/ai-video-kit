@@ -1,0 +1,47 @@
+node_modules
+lerna-debug.log
+npm-debug.log
+.DS_Store
+.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+packages/*/dist/
+# The former build output (now packages/gl-transitions/dist)
+release/
+packages/*/src/*.generated.ts
+# The Rust crate: its generated/ folder is written by scripts/rust-crate/build-crate.mjs.
+crates/*/generated/
+crates/*/target/
+examples/fframes/target/
+examples/fframes/out/
+# The Swift package: its catalog and license notices are written by scripts/swift-package/build-swift-package.mjs.
+swift/Sources/GLTransitions/Generated/
+swift/LICENSES.md
+swift/.build/
+swift/.swiftpm/
+
+# The Swift example app (examples/swiftui).
+examples/swiftui/.build/
+examples/swiftui/.swiftpm/
+examples/swiftui/iOS/*.xcodeproj/project.xcworkspace/
+examples/swiftui/iOS/*.xcodeproj/xcuserdata/
+
+# The Android library: its catalog and resources are written by scripts/android-library/build-android-library.mjs.
+android/gl-transitions/src/main/kotlin/com/gltransitions/generated/
+android/gl-transitions/src/main/resources/
+android/.gradle/
+android/build/
+android/gl-transitions/build/
+android/local.properties
+
+# The Android example app (examples/android).
+examples/android/.gradle/
+examples/android/build/
+examples/android/app/build/
+examples/android/local.properties
+
+# Claude Code: local settings and worktrees stay out, the project skills are shared.
+.claude/*
+!.claude/skills/

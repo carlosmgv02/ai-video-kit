@@ -1,0 +1,282 @@
+name: Preview Comment
+
+# Trusted companion to preview.yml: consumes the artifact (GIFs, validation JSON,
+# PR number) to publish GIFs and comment. Runs with write perms but never executes PR code.
+on:
+  workflow_run:
+    workflows: ["Preview"]
+    types:
+      - completed
+
+# One group per PR branch: a newer pending run replaces an older one of the same PR. Not a
+# global group, which keeps a single pending run and cancels the others' comments when a
+# stack is pushed; runs of different PRs retry their push to preview-assets instead.
+concurrency:
+  group: preview-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  comment:
+    # Preview only runs on pull_request; refuse anything else before touching the artifact.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 so origin/preview-assets resolves; else the publish step wipes it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download previews artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: transition-previews
+          path: previews
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read and validate PR number
+        if: steps.download.outcome == 'success'
+        id: meta
+        run: |
+          if [ ! -f previews/pr.txt ]; then
+            echo "No pr.txt in artifact — nothing to comment on."
+            echo "pr=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PR=$(cat previews/pr.txt)
+          # Untrusted artifact input.
+          if ! printf '%s' "$PR" | grep -qE '^[1-9][0-9]*$'; then
+            echo "::error::Invalid PR number from artifact: '$PR'"
+            exit 1
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+      # pr.txt comes from the untrusted run, so a fork PR could forge it: check that this
+      # run was produced by that PR before publishing or commenting anything.
+      - name: Check the run belongs to the PR
+        if: steps.meta.outputs.pr != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.meta.outputs.pr }}
+        with:
+          script: |
+            const pr = Number(process.env.PR_NUMBER);
+            const wr = context.payload.workflow_run;
+            const { data: prData } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr,
+            });
+            // head_sha may be the PR head or the merge commit checked out for the run.
+            const allowed = [prData.head.sha, prData.merge_commit_sha].filter(Boolean);
+            if (!allowed.includes(wr.head_sha)) {
+              core.setFailed(`PR #${pr} (head ${prData.head.sha}) does not match the Preview run head (${wr.head_sha}); refusing to publish.`);
+            }
+
+      - name: Publish GIFs to preview-assets branch
+        if: steps.meta.outputs.pr != ''
+        env:
+          PREFIX: run-${{ github.event.workflow_run.id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Bounded: at most 12 GIFs (the 6 previews, with their GIFs over black) and 100 MB per run,
+          # real GIFs only (the branch is served from raw.githubusercontent.com), and only the 200
+          # most recent GIFs are kept.
+          mkdir -p "$RUNNER_TEMP/gifs"
+          COUNT=0
+          TOTAL=0
+          for gif in previews/*.gif; do
+            # Untrusted artifact: don't dereference symlinks.
+            [ -f "$gif" ] && [ ! -L "$gif" ] || continue
+            magic=$(head -c 6 -- "$gif")
+            if [ "$magic" != "GIF89a" ] && [ "$magic" != "GIF87a" ]; then
+              echo "::warning::Skipping $(basename -- "$gif"): not a GIF"
+              continue
+            fi
+            size=$(stat -c %s -- "$gif")
+            if [ "$COUNT" -ge 12 ] || [ $((TOTAL + size)) -gt 100000000 ]; then
+              echo "::warning::Skipping $(basename -- "$gif"): over the per-run budget"
+              basename -- "$gif" >> "$RUNNER_TEMP/over-budget.txt"
+              continue
+            fi
+            cp -- "$gif" "$RUNNER_TEMP/gifs/${PREFIX}-$(basename -- "$gif")"
+            basename -- "$gif" >> "$RUNNER_TEMP/published.txt"
+            COUNT=$((COUNT + 1))
+            TOTAL=$((TOTAL + size))
+          done
+          [ "$COUNT" -gt 0 ] || exit 0
+
+          # Runs of other PRs publish concurrently: commit on top of the latest preview-assets and
+          # push with a lease, refetching and retrying when another run pushed in between.
+          for attempt in 1 2 3 4 5; do
+            git fetch -q origin preview-assets 2>/dev/null || true
+            if BASE=$(git rev-parse -q --verify origin/preview-assets); then
+              git checkout -q -f --detach "$BASE"
+            else
+              BASE=""
+              git checkout -q -f --orphan "preview-assets-$attempt"
+              git rm -rfq . 2>/dev/null || true
+            fi
+            for gif in "$RUNNER_TEMP"/gifs/*.gif; do
+              cp -- "$gif" .
+              git add -- "$(basename -- "$gif")"
+            done
+
+            # Retention: keep the 200 most recent GIFs (run ids only grow).
+            git ls-files -- 'run-*.gif' | sort -t- -k2,2nr | tail -n +201 | xargs -r git rm -q --
+
+            # Publish the branch as a single commit, so pruned GIFs don't stay in its history.
+            TREE=$(git write-tree)
+            COMMIT=$(git commit-tree "$TREE" -m "Preview GIFs (latest: ${PREFIX})")
+            if git push --force-with-lease="preview-assets:$BASE" origin "$COMMIT:refs/heads/preview-assets"; then
+              exit 0
+            fi
+            sleep $((attempt * 5 + RANDOM % 10))
+          done
+          echo "::error::Could not publish to preview-assets after 5 attempts"
+          exit 1
+
+      - name: Post preview comment with inline GIFs
+        if: steps.meta.outputs.pr != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.meta.outputs.pr }}
+          PREFIX: run-${{ github.event.workflow_run.id }}
+          GIF_DIR: previews
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const prRaw = process.env.PR_NUMBER || '';
+            if (!/^[1-9]\d*$/.test(prRaw)) {
+              core.setFailed(`Invalid PR number: ${JSON.stringify(prRaw)}`);
+              return;
+            }
+            const pr = Number(prRaw);
+            const prefix = process.env.PREFIX;
+            // Only link the GIFs the publish step accepted.
+            let published = new Set();
+            try {
+              published = new Set(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'published.txt'), 'utf8').split('\n').filter(Boolean));
+            } catch {}
+            // and the ones it skipped only for its per-run budget
+            let overBudget = new Set();
+            try {
+              overBudget = new Set(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'over-budget.txt'), 'utf8').split('\n').filter(Boolean));
+            } catch {}
+            const dir = process.env.GIF_DIR;
+            // Wrap untrusted strings in an inline-code span (no backticks/newlines, capped)
+            // so a fork PR can't inject @mentions or Markdown into the bot comment.
+            const code = s => '`' + String(s).replace(/`/g, "'").replace(/[\r\n]+/g, ' ').slice(0, 300) + '`';
+            const baseUrl = `https://raw.githubusercontent.com/${context.repo.owner}/${context.repo.repo}/preview-assets`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('## Transition Preview')
+            );
+
+            // Untrusted artifact: regular files only (skip symlinks).
+            const isRegular = f => {
+              try { return fs.lstatSync(path.join(dir, f)).isFile(); } catch { return false; }
+            };
+            // The render step renders the first PREVIEWS transitions (like preview.yml); the others
+            // are listed with their validation result only. The list is capped to keep the comment
+            // within API size limits.
+            const PREVIEWS = 6;
+            const all = fs.readdirSync(dir)
+              .filter(f => f.endsWith('.validation.json') && isRegular(f))
+              .map(f => f.slice(0, -'.validation.json'.length))
+              .sort()
+              .slice(0, 300);
+            const readValidation = name => {
+              const validationPath = path.join(dir, `${name}.validation.json`);
+              try {
+                // Untrusted artifact: cap the size before parsing.
+                if (fs.statSync(validationPath).size <= 100000) {
+                  return JSON.parse(fs.readFileSync(validationPath, 'utf8'));
+                }
+              } catch {}
+              return null;
+            };
+            const rendered = all.filter(name => isRegular(`${name}.gif`));
+            const names = (rendered.length ? rendered : all).slice(0, PREVIEWS);
+            const rest = all.filter(name => !names.includes(name));
+
+            let body = '## Transition Preview\n\n';
+
+            for (const name of names) {
+              const validation = readValidation(name);
+
+              const hasGif = published.has(`${name}.gif`);
+              const icon = validation?.valid === true ? '✅' : validation?.valid === false ? '❌' : '⚠️';
+              body += `### ${icon} ${code(name)}\n\n`;
+
+              if (hasGif) {
+                const gifUrl = `${baseUrl}/${prefix}-${encodeURIComponent(name)}.gif`;
+                body += `![preview](${gifUrl})`;
+                // Transitions with transparency: the first GIF is over white, this one over black
+                if (published.has(`${name}.black.gif`)) {
+                  body += ` ![preview over black](${baseUrl}/${prefix}-${encodeURIComponent(name)}.black.gif)`;
+                }
+                body += `\n\n`;
+              } else if (overBudget.has(`${name}.gif`)) {
+                body += `⏭️ Preview rendered but not published: this run is over its budget of GIFs (too many transitions changed at once)\n\n`;
+              } else {
+                body += `⚠️ Failed to render preview\n\n`;
+              }
+
+              if (validation) {
+                if (Array.isArray(validation.errors) && validation.errors.length > 0) {
+                  body += `**Errors:**\n${validation.errors.map(e => `- ${code(e)}`).join('\n')}\n\n`;
+                }
+                if (Array.isArray(validation.warnings) && validation.warnings.length > 0) {
+                  body += `**Warnings:**\n${validation.warnings.map(w => `- ${code(w)}`).join('\n')}\n\n`;
+                }
+                if (validation.valid) {
+                  body += `Shader validation passed.\n\n`;
+                }
+              }
+            }
+
+            if (rest.length) {
+              body += `**${rest.length} more changed transition${rest.length > 1 ? 's are' : ' is'} not previewed here:** previews are limited to ${PREVIEWS} per pull request. ${rest.length > 1 ? 'They were' : 'It was'} still validated:\n\n`;
+              for (const name of rest) {
+                const validation = readValidation(name);
+                const icon = validation?.valid === true ? '✅' : validation?.valid === false ? '❌' : '⚠️';
+                const firstError = Array.isArray(validation?.errors) && validation.errors.length ? `: ${code(validation.errors[0])}` : '';
+                body += `- ${icon} ${code(name)}${firstError}\n`;
+              }
+              body += `\n`;
+            }
+
+            body += `---\n🤖 Generated by the [preview bot](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr,
+                body,
+              });
+            }
